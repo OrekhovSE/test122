@@ -34,16 +34,29 @@ dataset/
 │   │   ├── vertical/
 │   │   └── unknown/
 │   └── labels/
-│       ├── classes.txt
 │       ├── oneline/
+│       │   └── classes.txt
 │       ├── twolines/
+│       │   └── classes.txt
 │       ├── vertical/
+│       │   └── classes.txt
 │       └── unknown/
+│           └── classes.txt
 └── ...
 
 Классы YOLO:
-0 = container  (общий bbox, вычисленный как union всех bbox класса 1)
+0 = container  (берётся напрямую из нового поля container_bbox)
 1 = text       (каждый bbox из ocr_debug.segmentation_overlay.items)
+
+container_bbox имеет формат:
+[x_min, y_min, x_max, y_max]
+и считается координатами исходного изображения.
+
+Для class 1:
+- если bbox уже лежат внутри container_bbox, они считаются source-coordinates;
+- иначе, если segmentation_overlay содержит размер layout, bbox масштабируются внутрь container_bbox;
+- если размер layout отсутствует, используется fallback scaled_inferred
+  по максимальным x2/y2 локальных bbox. Этот режим отмечается в results.csv.
 """
 
 import argparse
@@ -293,26 +306,62 @@ def resolve_type(folder_type, selected_route):
     return "unknown", "service"
 
 
-def parse_service_boxes(data):
-    """
-    Возвращает bbox из:
-      ocr_debug.segmentation_overlay.items[*].box
+def parse_box(value):
+    """Парсит [x_min, y_min, x_max, y_max]."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
 
-    Ожидаемый формат bbox:
-      [x1, y1, x2, y2]
+    try:
+        x1, y1, x2, y2 = [float(v) for v in value]
+    except (TypeError, ValueError):
+        return None
 
-    Все эти bbox становятся классом 1.
+    if x2 < x1:
+        x1, x2 = x2, x1
+
+    if y2 < y1:
+        y1, y2 = y2, y1
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    return x1, y1, x2, y2
+
+
+def parse_container_bbox(data):
     """
+    Новый bbox контейнерной зоны.
+
+    Поддерживаем оба варианта:
+      data["container_bbox"]
+      data["ocr_debug"]["container_bbox"]
+    """
+    box = parse_box(data.get("container_bbox"))
+    if box is not None:
+        return box
+
     ocr_debug = data.get("ocr_debug") or {}
+    if isinstance(ocr_debug, dict):
+        return parse_box(ocr_debug.get("container_bbox"))
 
+    return None
+
+
+def get_overlay(data):
+    ocr_debug = data.get("ocr_debug") or {}
     if not isinstance(ocr_debug, dict):
-        return []
+        return {}
 
     overlay = ocr_debug.get("segmentation_overlay") or {}
+    return overlay if isinstance(overlay, dict) else {}
 
-    if not isinstance(overlay, dict):
-        return []
 
+def parse_service_boxes(data):
+    """
+    Возвращает bbox класса 1 из:
+      ocr_debug.segmentation_overlay.items[*].box
+    """
+    overlay = get_overlay(data)
     items = overlay.get("items") or []
 
     if not isinstance(items, list):
@@ -324,29 +373,132 @@ def parse_service_boxes(data):
         if not isinstance(item, dict):
             continue
 
-        box = item.get("box")
-
-        if not isinstance(box, (list, tuple)) or len(box) != 4:
-            continue
-
-        try:
-            x1, y1, x2, y2 = [float(v) for v in box]
-        except (TypeError, ValueError):
-            continue
-
-        # Исправляем возможный перевёрнутый порядок.
-        if x2 < x1:
-            x1, x2 = x2, x1
-
-        if y2 < y1:
-            y1, y2 = y2, y1
-
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        boxes.append((x1, y1, x2, y2))
+        box = parse_box(item.get("box"))
+        if box is not None:
+            boxes.append(box)
 
     return boxes
+
+
+def parse_overlay_size(data):
+    """
+    Пытается получить размер координатного пространства segmentation_overlay.
+
+    Поддерживает:
+      "image_size": [w, h]
+      "size": [w, h]
+      "width": w, "height": h
+      "image_width": w, "image_height": h
+    """
+    overlay = get_overlay(data)
+
+    for key in ("image_size", "size"):
+        value = overlay.get(key)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            try:
+                w, h = float(value[0]), float(value[1])
+                if w > 0 and h > 0:
+                    return w, h
+            except (TypeError, ValueError):
+                pass
+
+    for wk, hk in (
+        ("width", "height"),
+        ("image_width", "image_height"),
+    ):
+        try:
+            w = float(overlay.get(wk))
+            h = float(overlay.get(hk))
+            if w > 0 and h > 0:
+                return w, h
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def box_inside(inner, outer, tolerance=1.0):
+    ix1, iy1, ix2, iy2 = inner
+    ox1, oy1, ox2, oy2 = outer
+
+    return (
+        ix1 >= ox1 - tolerance
+        and iy1 >= oy1 - tolerance
+        and ix2 <= ox2 + tolerance
+        and iy2 <= oy2 + tolerance
+    )
+
+
+def map_text_boxes_to_source(data, container_box, image_width, image_height):
+    """
+    Переводит bbox класса 1 в координаты исходного изображения.
+
+    Режимы:
+      source
+        text-box уже внутри container_bbox -> считаем source coords.
+
+      scaled_overlay
+        segmentation_overlay явно содержит размер layout.
+
+      scaled_inferred
+        размер layout отсутствует; используем max(x2), max(y2)
+        как размер локального пространства.
+    """
+    local_boxes = parse_service_boxes(data)
+
+    if not local_boxes:
+        return [], "no_text_boxes"
+
+    if container_box is None:
+        return [], "no_container"
+
+    container_box = clamp_box(container_box, image_width, image_height)
+    if container_box is None:
+        return [], "invalid_container"
+
+    if all(box_inside(box, container_box) for box in local_boxes):
+        result = []
+        for box in local_boxes:
+            clamped = clamp_box(box, image_width, image_height)
+            if clamped is not None:
+                result.append(clamped)
+        return result, "source"
+
+    overlay_size = parse_overlay_size(data)
+
+    if overlay_size is not None:
+        overlay_w, overlay_h = overlay_size
+        mapping_mode = "scaled_overlay"
+    else:
+        overlay_w = max(box[2] for box in local_boxes)
+        overlay_h = max(box[3] for box in local_boxes)
+        mapping_mode = "scaled_inferred"
+
+    if overlay_w <= 0 or overlay_h <= 0:
+        return [], "invalid_overlay_size"
+
+    cx1, cy1, cx2, cy2 = container_box
+    cw = cx2 - cx1
+    ch = cy2 - cy1
+
+    mapped = []
+
+    for x1, y1, x2, y2 in local_boxes:
+        sx1 = cx1 + (x1 / overlay_w) * cw
+        sy1 = cy1 + (y1 / overlay_h) * ch
+        sx2 = cx1 + (x2 / overlay_w) * cw
+        sy2 = cy1 + (y2 / overlay_h) * ch
+
+        source_box = clamp_box(
+            (sx1, sy1, sx2, sy2),
+            image_width,
+            image_height,
+        )
+
+        if source_box is not None:
+            mapped.append(source_box)
+
+    return mapped, mapping_mode
 
 
 def clamp_box(box, image_width, image_height):
@@ -386,14 +538,13 @@ def box_to_yolo(box, image_width, image_height):
     return x_center, y_center, width, height
 
 
-def build_yolo_lines(image_path: Path, boxes):
+def build_yolo_lines(image_path: Path, data):
     """
-    class 1 = каждый валидный bbox сервиса
-    class 0 = один union bbox, охватывающий все bbox класса 1
+    Формирует YOLO label:
 
-    Порядок:
-      сначала class 0
-      затем все class 1
+      class 0 = container_bbox из ответа сервера
+      class 1 = segmentation_overlay.items[*].box,
+                переведённые в координаты исходного изображения
     """
     with Image.open(image_path) as img:
         image_width, image_height = img.size
@@ -401,46 +552,84 @@ def build_yolo_lines(image_path: Path, boxes):
     if image_width <= 0 or image_height <= 0:
         raise ValueError(f"Некорректный размер изображения: {image_path}")
 
-    valid_boxes = []
+    raw_container = parse_container_bbox(data)
+    container_box = None
 
-    for box in boxes:
-        clamped = clamp_box(box, image_width, image_height)
-        if clamped is not None:
-            valid_boxes.append(clamped)
+    if raw_container is not None:
+        container_box = clamp_box(
+            raw_container,
+            image_width,
+            image_height,
+        )
 
-    if not valid_boxes:
-        return [], 0, image_width, image_height
+    text_boxes, mapping_mode = map_text_boxes_to_source(
+        data=data,
+        container_box=container_box,
+        image_width=image_width,
+        image_height=image_height,
+    )
 
     lines = []
 
-    # class 0: общий bbox.
-    container_box = union_boxes(valid_boxes)
-    x, y, w, h = box_to_yolo(container_box, image_width, image_height)
+    # class 0: напрямую из container_bbox.
+    if container_box is not None:
+        x, y, w, h = box_to_yolo(
+            container_box,
+            image_width,
+            image_height,
+        )
 
-    lines.append(
-        f"{CLASS_CONTAINER} {x:.6f} {y:.6f} {w:.6f} {h:.6f}"
-    )
+        lines.append(
+            f"{CLASS_CONTAINER} {x:.6f} {y:.6f} {w:.6f} {h:.6f}"
+        )
 
-    # class 1: все отдельные зоны текста/символов.
-    for box in valid_boxes:
-        x, y, w, h = box_to_yolo(box, image_width, image_height)
+    # class 1: зоны текста/символов.
+    for box in text_boxes:
+        x, y, w, h = box_to_yolo(
+            box,
+            image_width,
+            image_height,
+        )
 
         lines.append(
             f"{CLASS_TEXT} {x:.6f} {y:.6f} {w:.6f} {h:.6f}"
         )
 
-    return lines, len(valid_boxes), image_width, image_height
+    return (
+        lines,
+        len(text_boxes),
+        container_box is not None,
+        image_width,
+        image_height,
+        mapping_mode,
+        container_box,
+    )
 
 
 def write_classes_file(batch_root: Path):
-    labels_root = batch_root / "labels"
-    labels_root.mkdir(parents=True, exist_ok=True)
+    """
+    Создаёт отдельный classes.txt в каждой папке типа:
 
-    classes_path = labels_root / "classes.txt"
-    classes_path.write_text(
-        "\n".join(CLASS_NAMES) + "\n",
-        encoding="utf-8",
-    )
+      labels/oneline/classes.txt
+      labels/twolines/classes.txt
+      labels/vertical/classes.txt
+      labels/unknown/classes.txt
+
+    Содержимое везде одинаковое:
+      0 = container
+      1 = text
+    """
+    labels_root = batch_root / "labels"
+
+    for type_name in ALL_TYPES:
+        type_dir = labels_root / type_name
+        type_dir.mkdir(parents=True, exist_ok=True)
+
+        classes_path = type_dir / "classes.txt"
+        classes_path.write_text(
+            "\n".join(CLASS_NAMES) + "\n",
+            encoding="utf-8",
+        )
 
 
 def choose_destination_stem(
@@ -496,10 +685,21 @@ def save_and_move(
     Создаёт label и при необходимости перемещает image + text.
     Если image уже лежит в правильной type-папке, не переименовывает его.
     """
-    current_folder_type = folder_type_for_image(image_path, batch_root)
+    images_root = batch_root / "images"
+    rel_to_images = image_path.relative_to(images_root)
 
-    # Уже лежит в правильной папке: сохраняем существующее имя.
-    if current_folder_type == type_name:
+    # Считаем изображение уже лежащим в нужной папке ТОЛЬКО если
+    # путь реально начинается с images/<type_name>/...
+    #
+    # Важно: файл images/123.jpg раньше тоже получал folder_type="unknown",
+    # из-за чего при type_name="unknown" ошибочно считалось, что он уже
+    # находится в images/unknown/. Теперь это исправлено.
+    already_in_target_folder = (
+        len(rel_to_images.parts) >= 2
+        and rel_to_images.parts[0].lower() == type_name
+    )
+
+    if already_in_target_folder:
         stem = image_path.stem
         image_dst = image_path
         text_dst = batch_root / "text" / type_name / f"{stem}.txt"
@@ -580,6 +780,8 @@ def process_one(
         "server_total_ms": None,
         "text_boxes": 0,
         "container_box_created": False,
+        "container_bbox": "",
+        "text_box_mapping": "",
         "image_width": "",
         "image_height": "",
         "failure_reason": "",
@@ -692,15 +894,27 @@ def process_one(
                 row["server_total_ms"] += row["last_digit_elapsed_ms"]
 
         # ---- YOLO labels ----
-        service_boxes = parse_service_boxes(data)
-
-        yolo_lines, text_box_count, image_width, image_height = build_yolo_lines(
+        (
+            yolo_lines,
+            text_box_count,
+            container_box_created,
+            image_width,
+            image_height,
+            text_box_mapping,
+            container_box,
+        ) = build_yolo_lines(
             image_path=image_path,
-            boxes=service_boxes,
+            data=data,
         )
 
         row["text_boxes"] = text_box_count
-        row["container_box_created"] = text_box_count > 0
+        row["container_box_created"] = container_box_created
+        row["container_bbox"] = (
+            ",".join(f"{v:.3f}" for v in container_box)
+            if container_box is not None
+            else ""
+        )
+        row["text_box_mapping"] = text_box_mapping
         row["image_width"] = image_width
         row["image_height"] = image_height
 
@@ -983,8 +1197,8 @@ def main():
     print("Перемещение файлов:", "НЕТ" if args.no_move else "ДА")
     print()
     print("Классы:")
-    print("  0 = container (union всех bbox класса 1)")
-    print("  1 = text (каждый bbox из segmentation_overlay.items)")
+    print("  0 = container (напрямую из container_bbox)")
+    print("  1 = text (segmentation_overlay.items -> source coords)")
     print()
 
     session = requests.Session()
@@ -1067,6 +1281,8 @@ def main():
         "is_valid_iso",
         "text_boxes",
         "container_box_created",
+        "container_bbox",
+        "text_box_mapping",
         "image_width",
         "image_height",
         "request_ms",
